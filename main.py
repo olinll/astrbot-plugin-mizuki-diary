@@ -83,6 +83,24 @@ def _looks_like_slash_cmd(text: str) -> bool:
     return t.startswith("/") or t.startswith("diary ")
 
 
+def _event_has_payload(evt) -> bool:
+    """判断事件是否包含可处理内容（文本或图片）。
+
+    用来过滤 NapCat 的输入状态回调、心跳等空事件 —— 它们会被 session_waiter
+    当成普通消息事件，导致 push 确认立刻被当作"其他回复"取消。
+    """
+    text = (getattr(evt, "message_str", None) or "").strip()
+    if text:
+        return True
+    try:
+        for seg in evt.get_messages():
+            if isinstance(seg, Comp.Image):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 @register(
     PLUGIN_NAME,
     "olinll",
@@ -448,6 +466,9 @@ class MizukiDiaryPlugin(Star):
 
         @session_waiter(timeout=timeout, record_history_chains=False)
         async def waiter(controller: SessionController, evt: AstrMessageEvent):
+            if not _event_has_payload(evt):
+                controller.keep(timeout=timeout, reset_timeout=False)
+                return
             text = evt.message_str.strip() if evt.message_str else ""
 
             if _is_token(text, CANCEL_TOKENS):
@@ -690,6 +711,9 @@ class MizukiDiaryPlugin(Star):
 
         @session_waiter(timeout=timeout, record_history_chains=False)
         async def waiter(controller: SessionController, evt: AstrMessageEvent):
+            if not _event_has_payload(evt):
+                controller.keep(timeout=timeout, reset_timeout=False)
+                return
             text = (evt.message_str or "").strip()
 
             if _is_token(text, CANCEL_TOKENS):
@@ -929,6 +953,9 @@ class MizukiDiaryPlugin(Star):
 
         @session_waiter(timeout=60, record_history_chains=False)
         async def waiter(controller: SessionController, evt: AstrMessageEvent):
+            if not _event_has_payload(evt):
+                controller.keep(timeout=60, reset_timeout=False)
+                return
             text = (evt.message_str or "").strip()
             if text == "确认":
                 state["confirmed"] = True
