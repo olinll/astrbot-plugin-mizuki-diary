@@ -27,10 +27,10 @@ from .src.image_utils import ImageError
 
 PLUGIN_NAME = "astrbot_plugin_mizuki_diary"
 
-CANCEL_TOKENS = {"/diary cancel", "cancel", "/cancel", "取消"}
-DONE_TOKENS = {"/diary done", "done", "/done", "完成"}
-SKIP_TOKENS = {"skip", "/skip", "/diary skip", "跳过"}
-CLEAR_TOKENS = {"clear", "/clear", "/diary clear", "清空"}
+CANCEL_TOKENS = {"cancel", "取消"}
+DONE_TOKENS = {"done", "完成"}
+SKIP_TOKENS = {"skip", "跳过"}
+CLEAR_TOKENS = {"clear", "清空"}
 
 DONE_DISPLAY = "/diary done"
 CANCEL_DISPLAY = "/diary cancel"
@@ -52,10 +52,35 @@ HELP_TEXT = (
 )
 
 
+def _normalize_token(s: str) -> str:
+    """去掉前导 `/` 和 `diary ` 前缀，小写化。
+
+    兼容多种 AstrBot 前缀处理方式：
+    - "/diary done"   → "done"
+    - "diary done"    → "done"  (AstrBot 剥掉 /)
+    - "/done"         → "done"
+    - "done"          → "done"
+    - "  DONE  "      → "done"
+    """
+    t = s.strip().lower()
+    while t.startswith("/"):
+        t = t[1:]
+    if t.startswith("diary "):
+        t = t[6:].strip()
+    return t
+
+
 def _is_token(text: str, tokens: set[str]) -> bool:
-    """大小写/前缀兼容：兼容 AstrBot 可能去掉 `/` 或 `/diary ` 前缀的情况。"""
+    t = _normalize_token(text)
+    if not t:
+        return False
+    return t in {_normalize_token(x) for x in tokens}
+
+
+def _looks_like_slash_cmd(text: str) -> bool:
+    """检测用户是否试图发送 / 开头的指令（原始文本或剥离后都以 `diary` 开头）。"""
     t = text.strip().lower()
-    return t in {x.lower() for x in tokens}
+    return t.startswith("/") or t.startswith("diary ")
 
 
 @register(
@@ -391,6 +416,7 @@ class MizukiDiaryPlugin(Star):
         @session_waiter(timeout=timeout, record_history_chains=False)
         async def waiter(controller: SessionController, evt: AstrMessageEvent):
             text = evt.message_str.strip() if evt.message_str else ""
+            logger.info(f"[mizuki_diary] add waiter got: {text!r} step={state['step']}")
 
             if _is_token(text, CANCEL_TOKENS):
                 state["cancelled"] = True
@@ -456,6 +482,7 @@ class MizukiDiaryPlugin(Star):
     async def _step_content(self, controller, evt, state, timeout):
         text_raw = evt.message_str or ""
         text = text_raw.strip()
+        logger.info(f"[mizuki_diary] content step received: {text!r}")
 
         if _is_token(text, DONE_TOKENS):
             if not state["content_lines"]:
@@ -471,7 +498,7 @@ class MizukiDiaryPlugin(Star):
             controller.keep(timeout=timeout, reset_timeout=True)
             return
 
-        if text.startswith("/"):
+        if _looks_like_slash_cmd(text):
             await evt.send(evt.plain_result(
                 f"content 不能以 / 开头（避免与指令冲突）。\n"
                 f"完成输入发 {DONE_DISPLAY}，取消发 {CANCEL_DISPLAY}。"
@@ -739,7 +766,7 @@ class MizukiDiaryPlugin(Star):
                 state["completed"] = True
                 controller.stop()
                 return
-            if text.startswith("/"):
+            if _looks_like_slash_cmd(text):
                 await evt.send(evt.plain_result(
                     f"content 不能以 / 开头。完成发 {DONE_DISPLAY}，保持不变发 skip。"))
                 controller.keep(timeout=timeout, reset_timeout=True)
