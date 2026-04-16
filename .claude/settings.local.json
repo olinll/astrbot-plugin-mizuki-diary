@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import astrbot; print\\(astrbot.__file__\\)\")",
+      "Bash(curl -s -L https://docs.astrbot.app/dev/star/plugin-new.html -o /tmp/plugin-new.html)",
+      "Read(//tmp/**)",
+      "Bash(curl -s -L https://docs.astrbot.app/dev/plugin.html -o /tmp/plugin.html)",
+      "Bash(mkdir -p \"D:/projects/astrbot-plugin-mizuki-diary/.research\")",
+      "Bash(curl -s -L https://docs.astrbot.app/dev/star/plugin-new.html -o \"D:/projects/astrbot-plugin-mizuki-diary/.research/plugin-new.html\")",
+      "Bash(curl -s -L https://docs.astrbot.app/dev/plugin.html -o \"D:/projects/astrbot-plugin-mizuki-diary/.research/plugin.html\")",
+      "Bash(python -c ':*)",
+      "Bash(python)",
+      "Bash(curl -s -L \"https://raw.githubusercontent.com/AstrBotDevs/AstrBot/master/astrbot/core/message/components.py\" -o \"D:/projects/astrbot-plugin-mizuki-diary/.research/components.py\")",
+      "Bash(curl -s \"https://api.github.com/repos/olinll/Mizuki-Content/contents/\")",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(x['type'], x['name']\\) for x in d]\")",
+      "Bash(pip install:*)"
+    ]
+  }
+}

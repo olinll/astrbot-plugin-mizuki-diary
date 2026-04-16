@@ -1,0 +1,57 @@
+{
+    "github_token": {
+        "type": "string",
+        "description": "GitHub Personal Access Token (需要 Contents: Read & Write 权限)。建议使用 fine-grained token 并限制到目标仓库。",
+        "default": ""
+    },
+    "github_repo": {
+        "type": "string",
+        "description": "目标仓库 owner/name，例如 olinll/Mizuki-Content",
+        "default": "olinll/Mizuki-Content"
+    },
+    "github_branch": {
+        "type": "string",
+        "description": "目标分支",
+        "default": "master"
+    },
+    "diary_file_path": {
+        "type": "string",
+        "description": "日记数据文件在仓库中的路径",
+        "default": "data/diary.ts"
+    },
+    "image_repo_dir": {
+        "type": "string",
+        "description": "图片在仓库中存放的目录（相对仓库根）",
+        "default": "images/diary"
+    },
+    "image_url_prefix": {
+        "type": "string",
+        "description": "写入日记条目 images 字段的 URL 前缀",
+        "default": "/images/diary"
+    },
+    "allowed_user_ids": {
+        "type": "list",
+        "description": "允许使用本插件的 QQ 号白名单（留空表示禁用所有用户）",
+        "default": []
+    },
+    "timezone": {
+        "type": "string",
+        "description": "日期字段所用时区（IANA 名称）",
+        "default": "Asia/Shanghai"
+    },
+    "session_timeout": {
+        "type": "int",
+        "description": "多轮对话无响应超时时间（秒）",
+        "default": 300
+    },
+    "list_page_size": {
+        "type": "int",
+        "description": "/diary list 每页条数",
+        "default": 10
+    },
+    "webp_quality": {
+        "type": "int",
+        "description": "图片转 WebP 的质量（1-100）",
+        "default": 85
+    }
+}
