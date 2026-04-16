@@ -27,11 +27,13 @@ from .src.image_utils import ImageError
 
 PLUGIN_NAME = "astrbot_plugin_mizuki_diary"
 
-CANCEL_TOKEN = "/diary cancel"
-DONE_TOKEN = "/done"
-SKIP_TOKENS = {"skip", "跳过"}
-CLEAR_TOKENS = {"clear", "清空"}
-KEEP_TOKENS = {"keep", "保持"}
+CANCEL_TOKENS = {"/diary cancel", "cancel", "/cancel", "取消"}
+DONE_TOKENS = {"/diary done", "done", "/done", "完成"}
+SKIP_TOKENS = {"skip", "/skip", "/diary skip", "跳过"}
+CLEAR_TOKENS = {"clear", "/clear", "/diary clear", "清空"}
+
+DONE_DISPLAY = "/diary done"
+CANCEL_DISPLAY = "/diary cancel"
 
 HELP_TEXT = (
     "Mizuki Diary 指令：\n"
@@ -46,8 +48,14 @@ HELP_TEXT = (
     "/diary discard             放弃所有 pending\n"
     "/diary push                推送到 GitHub（二次确认）\n"
     "/diary cancel              取消当前多轮对话\n"
-    "\n多轮对话内：/done 结束当前步骤；skip/跳过 跳过可选项；/diary cancel 取消。"
+    "\n多轮对话内：/diary done 结束当前步骤；skip/跳过 跳过可选项；/diary cancel 取消。"
 )
+
+
+def _is_token(text: str, tokens: set[str]) -> bool:
+    """大小写/前缀兼容：兼容 AstrBot 可能去掉 `/` 或 `/diary ` 前缀的情况。"""
+    t = text.strip().lower()
+    return t in {x.lower() for x in tokens}
 
 
 @register(
@@ -374,8 +382,8 @@ class MizukiDiaryPlugin(Star):
 
         yield event.plain_result(
             f"开始新建日记 #{new_id}。\n"
-            f"请发送内容（支持多条消息），完成后发 {DONE_TOKEN}。\n"
-            f"随时可发 {CANCEL_TOKEN} 取消。"
+            f"请发送内容（支持多条消息），完成后发 {DONE_DISPLAY}。\n"
+            f"内容不能以 / 开头。随时可发 {CANCEL_DISPLAY} 取消。"
         )
 
         timeout = self._timeout()
@@ -384,16 +392,10 @@ class MizukiDiaryPlugin(Star):
         async def waiter(controller: SessionController, evt: AstrMessageEvent):
             text = evt.message_str.strip() if evt.message_str else ""
 
-            if text == CANCEL_TOKEN:
+            if _is_token(text, CANCEL_TOKENS):
                 state["cancelled"] = True
                 await evt.send(evt.plain_result("已取消，pending 未保存。"))
                 controller.stop()
-                return
-
-            if text.startswith("/diary ") and text != CANCEL_TOKEN:
-                await evt.send(evt.plain_result(
-                    f"多轮对话中，请先发 {CANCEL_TOKEN} 再执行其他命令。"))
-                controller.keep(timeout=timeout, reset_timeout=True)
                 return
 
             step = state["step"]
@@ -452,28 +454,41 @@ class MizukiDiaryPlugin(Star):
         )
 
     async def _step_content(self, controller, evt, state, timeout):
-        text = evt.message_str or ""
-        if text.strip() == DONE_TOKEN:
+        text_raw = evt.message_str or ""
+        text = text_raw.strip()
+
+        if _is_token(text, DONE_TOKENS):
             if not state["content_lines"]:
-                await evt.send(evt.plain_result(f"尚未输入内容，请先发送，或 {CANCEL_TOKEN} 取消。"))
-                controller.keep(timeout=timeout, reset_timeout=True)
-                return
-            state["item"]["content"] = "\n".join(state["content_lines"])
-            state["step"] = "date"
+                await evt.send(evt.plain_result(
+                    f"尚未输入内容，请先发送，或 {CANCEL_DISPLAY} 取消。"))
+            else:
+                state["item"]["content"] = "\n".join(state["content_lines"])
+                state["step"] = "date"
+                await evt.send(evt.plain_result(
+                    f"内容已记录。\n现在请发日期（YYYY-MM-DD HH:mm:ss），"
+                    f"或发 skip 使用当前时间 {self._now_str()}。"
+                ))
+            controller.keep(timeout=timeout, reset_timeout=True)
+            return
+
+        if text.startswith("/"):
             await evt.send(evt.plain_result(
-                f"内容已记录。\n现在请发日期（YYYY-MM-DD HH:mm:ss），"
-                f"或发 skip 使用当前时间 {self._now_str()}。"
+                f"content 不能以 / 开头（避免与指令冲突）。\n"
+                f"完成输入发 {DONE_DISPLAY}，取消发 {CANCEL_DISPLAY}。"
             ))
-        else:
-            state["content_lines"].append(text)
-            await evt.send(evt.plain_result(
-                f"已记录第 {len(state['content_lines'])} 段，继续发送或 {DONE_TOKEN} 完成。"
-            ))
+            controller.keep(timeout=timeout, reset_timeout=True)
+            return
+
+        state["content_lines"].append(text_raw)
+        await evt.send(evt.plain_result(
+            f"已记录第 {len(state['content_lines'])} 段，"
+            f"继续发送或 {DONE_DISPLAY} 完成。"
+        ))
         controller.keep(timeout=timeout, reset_timeout=True)
 
     async def _step_date(self, controller, evt, state, timeout):
         text = (evt.message_str or "").strip()
-        if text.lower() in SKIP_TOKENS:
+        if _is_token(text, SKIP_TOKENS):
             state["item"]["date"] = self._now_str()
         else:
             parsed = self._parse_date(text)
@@ -486,7 +501,7 @@ class MizukiDiaryPlugin(Star):
         state["step"] = "images"
         await evt.send(evt.plain_result(
             f"日期：{state['item']['date']}。\n"
-            f"现在请发图片（可多张，自动转 WebP），完成发 {DONE_TOKEN}，跳过发 skip。"
+            f"现在请发图片（可多张，自动转 WebP），完成发 {DONE_DISPLAY}，跳过发 skip。"
             "\n注意：不支持 GIF。"
         ))
         controller.keep(timeout=timeout, reset_timeout=True)
@@ -503,12 +518,12 @@ class MizukiDiaryPlugin(Star):
                 )
                 state["images"].append(info)
             await evt.send(evt.plain_result(
-                f"已收到 {len(state['images'])} 张图，继续发送或 {DONE_TOKEN} / skip。"
+                f"已收到 {len(state['images'])} 张图，继续发送或 {DONE_DISPLAY} / skip。"
             ))
             controller.keep(timeout=timeout, reset_timeout=True)
             return
 
-        if text == DONE_TOKEN:
+        if _is_token(text, DONE_TOKENS):
             if state["images"]:
                 state["item"]["images"] = [i["url"] for i in state["images"]]
             state["step"] = "location"
@@ -516,8 +531,7 @@ class MizukiDiaryPlugin(Star):
             controller.keep(timeout=timeout, reset_timeout=True)
             return
 
-        if text.lower() in SKIP_TOKENS:
-            # 放弃已缓存的
+        if _is_token(text, SKIP_TOKENS):
             for i in state["images"]:
                 Path(i["local_path"]).unlink(missing_ok=True)
             state["images"] = []
@@ -526,12 +540,12 @@ class MizukiDiaryPlugin(Star):
             controller.keep(timeout=timeout, reset_timeout=True)
             return
 
-        await evt.send(evt.plain_result(f"请发图片，或 {DONE_TOKEN} 完成 / skip 跳过。"))
+        await evt.send(evt.plain_result(f"请发图片，或 {DONE_DISPLAY} 完成 / skip 跳过。"))
         controller.keep(timeout=timeout, reset_timeout=True)
 
     async def _step_location(self, controller, evt, state, timeout):
         text = (evt.message_str or "").strip()
-        if text.lower() in SKIP_TOKENS:
+        if _is_token(text, SKIP_TOKENS):
             pass
         elif text:
             state["item"]["location"] = text
@@ -543,7 +557,7 @@ class MizukiDiaryPlugin(Star):
 
     async def _step_mood(self, controller, evt, state, timeout, moods_hist):
         text = (evt.message_str or "").strip()
-        if text.lower() in SKIP_TOKENS:
+        if _is_token(text, SKIP_TOKENS):
             pass
         elif text:
             state["item"]["mood"] = text
@@ -557,7 +571,7 @@ class MizukiDiaryPlugin(Star):
 
     async def _step_tags(self, controller, evt, state, timeout, tags_hist):
         text = (evt.message_str or "").strip()
-        if text.lower() not in SKIP_TOKENS and text:
+        if not _is_token(text, SKIP_TOKENS) and text:
             parts = [t.strip() for t in text.replace("，", ",").split(",") if t.strip()]
             if parts:
                 state["item"]["tags"] = parts
@@ -599,7 +613,7 @@ class MizukiDiaryPlugin(Star):
             f"当前内容：{(item.get('content') or '')[:50]}\n"
             "请选择要修改的字段：\n"
             "1. content  2. date  3. images  4. location  5. mood  6. tags\n"
-            f"回复编号；或 {CANCEL_TOKEN} 取消。"
+            f"回复编号；或 {CANCEL_DISPLAY} 取消。"
         )
 
         timeout = self._timeout()
@@ -608,14 +622,10 @@ class MizukiDiaryPlugin(Star):
         async def waiter(controller: SessionController, evt: AstrMessageEvent):
             text = (evt.message_str or "").strip()
 
-            if text == CANCEL_TOKEN:
+            if _is_token(text, CANCEL_TOKENS):
                 state["cancelled"] = True
                 await evt.send(evt.plain_result("已取消。"))
                 controller.stop()
-                return
-            if text.startswith("/diary ") and text != CANCEL_TOKEN:
-                await evt.send(evt.plain_result(f"多轮对话中，请先 {CANCEL_TOKEN}。"))
-                controller.keep(timeout=timeout, reset_timeout=True)
                 return
 
             try:
@@ -680,8 +690,8 @@ class MizukiDiaryPlugin(Star):
         if field == "content":
             cur = (item.get("content") or "")
             await evt.send(evt.plain_result(
-                f"当前：\n{cur}\n\n请发送新内容（可多条消息），完成发 {DONE_TOKEN}；"
-                f"发 skip 保持不变。"
+                f"当前：\n{cur}\n\n请发送新内容（可多条消息，不能以 / 开头），"
+                f"完成发 {DONE_DISPLAY}；发 skip 保持不变。"
             ))
         elif field == "date":
             await evt.send(evt.plain_result(
@@ -692,7 +702,7 @@ class MizukiDiaryPlugin(Star):
             await evt.send(evt.plain_result(
                 f"当前有 {len(cur)} 张图。\n"
                 f"请发送新图片序列（将完全替换原有）。\n"
-                f"{DONE_TOKEN} 完成；clear 清空为空；skip 保持不变。"
+                f"{DONE_DISPLAY} 完成；clear 清空为空；skip 保持不变。"
             ))
         elif field == "location":
             await evt.send(evt.plain_result(
@@ -712,11 +722,11 @@ class MizukiDiaryPlugin(Star):
 
     async def _edit_input(self, controller, evt, state, item, diary_id, timeout):
         field = state["field"]
-        text = (evt.message_str or "").strip()
-        low = text.lower()
+        text_raw = evt.message_str or ""
+        text = text_raw.strip()
 
         if field == "content":
-            if text == DONE_TOKEN:
+            if _is_token(text, DONE_TOKENS):
                 if not state["content_lines"]:
                     await evt.send(evt.plain_result("内容为空，继续输入或 skip 保持原样。"))
                     controller.keep(timeout=timeout, reset_timeout=True)
@@ -725,18 +735,23 @@ class MizukiDiaryPlugin(Star):
                 state["completed"] = True
                 controller.stop()
                 return
-            if low in SKIP_TOKENS:
+            if _is_token(text, SKIP_TOKENS):
                 state["completed"] = True
                 controller.stop()
                 return
-            state["content_lines"].append(evt.message_str or "")
+            if text.startswith("/"):
+                await evt.send(evt.plain_result(
+                    f"content 不能以 / 开头。完成发 {DONE_DISPLAY}，保持不变发 skip。"))
+                controller.keep(timeout=timeout, reset_timeout=True)
+                return
+            state["content_lines"].append(text_raw)
             await evt.send(evt.plain_result(
-                f"已记录第 {len(state['content_lines'])} 段，继续或 {DONE_TOKEN}。"))
+                f"已记录第 {len(state['content_lines'])} 段，继续或 {DONE_DISPLAY}。"))
             controller.keep(timeout=timeout, reset_timeout=True)
             return
 
         if field == "date":
-            if low in SKIP_TOKENS:
+            if _is_token(text, SKIP_TOKENS):
                 state["completed"] = True
                 controller.stop()
                 return
@@ -759,15 +774,15 @@ class MizukiDiaryPlugin(Star):
                     info = await self._download_and_process_image(seg, date, diary_id, index)
                     state["images"].append(info)
                 await evt.send(evt.plain_result(
-                    f"已收到 {len(state['images'])} 张，继续或 {DONE_TOKEN} 完成。"))
+                    f"已收到 {len(state['images'])} 张，继续或 {DONE_DISPLAY} 完成。"))
                 controller.keep(timeout=timeout, reset_timeout=True)
                 return
-            if text == DONE_TOKEN:
+            if _is_token(text, DONE_TOKENS):
                 state["patch_fields"]["images"] = [i["url"] for i in state["images"]]
                 state["completed"] = True
                 controller.stop()
                 return
-            if low in CLEAR_TOKENS:
+            if _is_token(text, CLEAR_TOKENS):
                 for i in state["images"]:
                     Path(i["local_path"]).unlink(missing_ok=True)
                 state["images"] = []
@@ -775,23 +790,23 @@ class MizukiDiaryPlugin(Star):
                 state["completed"] = True
                 controller.stop()
                 return
-            if low in SKIP_TOKENS:
+            if _is_token(text, SKIP_TOKENS):
                 for i in state["images"]:
                     Path(i["local_path"]).unlink(missing_ok=True)
                 state["images"] = []
                 state["completed"] = True
                 controller.stop()
                 return
-            await evt.send(evt.plain_result(f"发图片 / {DONE_TOKEN} / skip / clear。"))
+            await evt.send(evt.plain_result(f"发图片 / {DONE_DISPLAY} / skip / clear。"))
             controller.keep(timeout=timeout, reset_timeout=True)
             return
 
         if field in ("location", "mood"):
-            if low in SKIP_TOKENS:
+            if _is_token(text, SKIP_TOKENS):
                 state["completed"] = True
                 controller.stop()
                 return
-            if low in CLEAR_TOKENS:
+            if _is_token(text, CLEAR_TOKENS):
                 state["patch_fields"][field] = ""
                 state["completed"] = True
                 controller.stop()
@@ -806,16 +821,15 @@ class MizukiDiaryPlugin(Star):
             return
 
         if field == "tags":
-            if low in SKIP_TOKENS:
+            if _is_token(text, SKIP_TOKENS):
                 state["completed"] = True
                 controller.stop()
                 return
-            if low in CLEAR_TOKENS:
+            if _is_token(text, CLEAR_TOKENS):
                 state["patch_fields"]["tags"] = []
                 state["completed"] = True
                 controller.stop()
                 return
-            seps = [","] if "," in text else ["，"]
             parts = [t.strip() for t in text.replace("，", ",").split(",") if t.strip()]
             if parts:
                 state["patch_fields"]["tags"] = parts
