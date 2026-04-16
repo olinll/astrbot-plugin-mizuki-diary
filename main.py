@@ -40,7 +40,8 @@ HELP_TEXT = (
     "/diary help                查看帮助\n"
     "/diary list [page]         列出日记（含已删除）\n"
     "/diary preview <id>        预览一条（含图片）\n"
-    "/diary add                 新增（多轮对话）\n"
+    "/diary quick [文字]        快速新增（文字 + 图片两步）\n"
+    "/diary add                 新增（完整多轮对话）\n"
     "/diary edit <id>           修改（字段菜单）\n"
     "/diary del <id>            删除（注释掉）\n"
     "/diary restore <id>        恢复已删除\n"
@@ -48,6 +49,7 @@ HELP_TEXT = (
     "/diary discard             放弃所有 pending\n"
     "/diary push                推送到 GitHub（二次确认）\n"
     "/diary cancel              取消当前多轮对话\n"
+    "\nquick 的首行可加 # 字段头：#地点:xxx #心情:xxx #标签:a,b #日期:YYYY-MM-DD HH:mm:ss"
     "\n多轮对话内：/diary done 结束当前步骤；skip/跳过 跳过可选项；/diary cancel 取消。"
 )
 
@@ -357,7 +359,7 @@ class MizukiDiaryPlugin(Star):
         if item.get("_deleted"):
             yield event.plain_result(f"#{id} 已是删除状态。")
             return
-        self.store.add_patch({"op": "delete", "id": id})
+        self.store.add_patch({"op": "delete", "id": int(item.get("id", id))})
         yield event.plain_result(f"已标记 #{id} 删除，/diary push 推送。")
 
     @diary.command("restore")
@@ -377,7 +379,7 @@ class MizukiDiaryPlugin(Star):
         if not item.get("_deleted"):
             yield event.plain_result(f"#{id} 当前未被删除，无需恢复。")
             return
-        self.store.add_patch({"op": "restore", "id": id})
+        self.store.add_patch({"op": "restore", "id": int(item.get("id", id))})
         yield event.plain_result(f"已标记 #{id} 恢复，/diary push 推送。")
 
     @diary.command("diff")
@@ -425,6 +427,222 @@ class MizukiDiaryPlugin(Star):
                     Path(f["local_path"]).unlink(missing_ok=True)
                 except Exception:
                     pass
+
+    # ------------------------------------------------------ quick (2-step)
+
+    @staticmethod
+    def _strip_quick_prefix(s: str) -> str:
+        """去掉 '/diary quick' / 'diary quick' 前缀，返回剩余文本（保留内部换行）。
+
+        AstrBot 不同版本可能：(a) 把完整消息 `/diary quick xxx` 原样放进 message_str；
+        (b) 剥掉指令只留参数；(c) 剥到只剩 `quick xxx`。三种情况都兼容。
+        """
+        if not s:
+            return ""
+        stripped = s.lstrip()
+        low = stripped.lower()
+        for pref in ("/diary quick", "diary quick", "quick"):
+            if low.startswith(pref):
+                rest = stripped[len(pref):]
+                if not rest or rest[0] in " \t\r\n":
+                    return rest.lstrip(" \t\r\n")
+        return s
+
+    _QUICK_FIELD_ALIASES = {
+        "地点": "location", "location": "location",
+        "心情": "mood", "mood": "mood",
+        "标签": "tags", "tags": "tags", "tag": "tags",
+        "日期": "date", "date": "date",
+    }
+
+    def _apply_quick_text(self, item: dict[str, Any], text: str) -> None:
+        """解析首部 '#key:value' 行为字段，剩下当正文。"""
+        lines = text.splitlines()
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                i += 1
+                continue
+            if not line.startswith("#"):
+                break
+            header = line[1:].strip()
+            if ":" in header:
+                k, _, v = header.partition(":")
+            elif "：" in header:
+                k, _, v = header.partition("：")
+            else:
+                break
+            canonical = self._QUICK_FIELD_ALIASES.get(k.strip().lower())
+            if not canonical:
+                break
+            v = v.strip()
+            if not v:
+                i += 1
+                continue
+            if canonical == "tags":
+                parts = [t.strip() for t in v.replace("，", ",").split(",") if t.strip()]
+                if parts:
+                    item["tags"] = parts
+            elif canonical == "date":
+                parsed = self._parse_date(v)
+                if parsed:
+                    item["date"] = parsed
+            else:
+                item[canonical] = v
+            i += 1
+        content_lines = lines[i:]
+        while content_lines and not content_lines[-1].strip():
+            content_lines.pop()
+        while content_lines and not content_lines[0].strip():
+            content_lines.pop(0)
+        if content_lines:
+            item["content"] = "\n".join(content_lines)
+        if "date" not in item:
+            item["date"] = self._now_str()
+
+    @diary.command("quick")
+    async def cmd_quick(self, event: AstrMessageEvent):
+        if not self._is_allowed(event):
+            yield self._deny(event)
+            return
+        try:
+            _, working = await self._current_view()
+        except (GithubError, diary_parser.DiaryParseError) as e:
+            yield event.plain_result(f"获取远程失败：{e}")
+            return
+
+        new_id = self._next_id(working)
+        body = self._strip_quick_prefix(event.message_str or "")
+
+        state: dict[str, Any] = {
+            "step": "images" if body else "content",
+            "item": {"id": new_id},
+            "images": [],
+            "cancelled": False,
+            "completed": False,
+            "error": None,
+        }
+
+        if body:
+            self._apply_quick_text(state["item"], body)
+            if not state["item"].get("content"):
+                yield event.plain_result(
+                    f"文字为空（只识别到 # 字段头）。请重发一条作为正文，{CANCEL_DISPLAY} 取消。"
+                )
+                state["step"] = "content"
+            else:
+                yield event.plain_result(
+                    f"文字已记录 #{new_id}。现在发图片（可多张），"
+                    f"完成发 {DONE_DISPLAY}，无图发 skip。"
+                )
+        else:
+            yield event.plain_result(
+                f"/diary quick #{new_id}：请发一条消息作为日记正文。\n"
+                f"首行可加 #地点:xxx / #心情:xxx / #标签:a,b / #日期:YYYY-MM-DD HH:mm:ss。\n"
+                f"{CANCEL_DISPLAY} 取消。"
+            )
+
+        timeout = self._timeout()
+
+        @session_waiter(timeout=timeout, record_history_chains=False)
+        async def waiter(controller: SessionController, evt: AstrMessageEvent):
+            if not _event_has_payload(evt):
+                controller.keep(timeout=timeout, reset_timeout=False)
+                return
+            text = (evt.message_str or "").strip()
+
+            if _is_token(text, CANCEL_TOKENS):
+                state["cancelled"] = True
+                await evt.send(evt.plain_result("已取消。"))
+                controller.stop()
+                return
+
+            try:
+                if state["step"] == "content":
+                    if _looks_like_slash_cmd(text):
+                        await evt.send(evt.plain_result(
+                            f"正文不能以 / 开头。{CANCEL_DISPLAY} 取消。"
+                        ))
+                        controller.keep(timeout=timeout, reset_timeout=True)
+                        return
+                    self._apply_quick_text(state["item"], evt.message_str or "")
+                    if not state["item"].get("content"):
+                        await evt.send(evt.plain_result(
+                            "还是没有正文内容，请再发一条。"
+                        ))
+                        controller.keep(timeout=timeout, reset_timeout=True)
+                        return
+                    state["step"] = "images"
+                    await evt.send(evt.plain_result(
+                        f"文字已记录。现在发图片，完成发 {DONE_DISPLAY}，无图发 skip。"
+                    ))
+                    controller.keep(timeout=timeout, reset_timeout=True)
+                    return
+
+                imgs = [seg for seg in evt.get_messages() if isinstance(seg, Comp.Image)]
+                if imgs:
+                    for seg in imgs:
+                        index = len(state["images"]) + 1
+                        info = await self._download_and_process_image(
+                            seg, state["item"]["date"], new_id, index
+                        )
+                        state["images"].append(info)
+                    await evt.send(evt.plain_result(
+                        f"已收到 {len(state['images'])} 张图，继续或 {DONE_DISPLAY} 完成。"
+                    ))
+                    controller.keep(timeout=timeout, reset_timeout=True)
+                    return
+
+                if _is_token(text, DONE_TOKENS) or _is_token(text, SKIP_TOKENS):
+                    if state["images"]:
+                        state["item"]["images"] = [i["url"] for i in state["images"]]
+                    state["completed"] = True
+                    controller.stop()
+                    return
+
+                await evt.send(evt.plain_result(
+                    f"请发图片，或 {DONE_DISPLAY} 完成 / skip 无图完成。"
+                ))
+                controller.keep(timeout=timeout, reset_timeout=True)
+            except ImageError as e:
+                await evt.send(evt.plain_result(f"图片处理失败：{e}"))
+                controller.keep(timeout=timeout, reset_timeout=True)
+            except Exception as e:
+                logger.exception("diary quick error")
+                state["error"] = str(e)
+                controller.stop()
+
+        try:
+            await waiter(event)
+        except TimeoutError:
+            event.stop_event()
+            for img in state["images"]:
+                Path(img["local_path"]).unlink(missing_ok=True)
+            yield event.plain_result("会话超时，已取消。")
+            return
+
+        event.stop_event()
+
+        if state["cancelled"] or state["error"]:
+            for img in state["images"]:
+                Path(img["local_path"]).unlink(missing_ok=True)
+            if state["error"]:
+                yield event.plain_result(f"出错：{state['error']}")
+            return
+        if not state["completed"]:
+            return
+
+        item = state["item"]
+        item["_deleted"] = False
+        image_files = [
+            {"local_path": i["local_path"], "remote_path": i["remote_path"]}
+            for i in state["images"]
+        ]
+        self.store.add_patch({"op": "add", "item": item, "image_files": image_files})
+        yield event.plain_result(
+            f"已暂存新增 #{new_id}。/diary push 推送，/diary preview {new_id} 预览。"
+        )
 
     # -------------------------------------------------------- add (multi-turn)
 
@@ -758,7 +976,7 @@ class MizukiDiaryPlugin(Star):
             {"local_path": i["local_path"], "remote_path": i["remote_path"]}
             for i in state["images"]
         ]
-        patch = {"op": "edit", "id": id, "fields": state["patch_fields"]}
+        patch = {"op": "edit", "id": int(item.get("id", id)), "fields": state["patch_fields"]}
         if image_files:
             patch["image_files"] = image_files
         self.store.add_patch(patch)
@@ -989,7 +1207,7 @@ class MizukiDiaryPlugin(Star):
         yield event.plain_result(f"推送成功 ✅\ncommit: {commit_sha[:10]}")
 
     def _build_commit_message(self, working: list[dict[str, Any]]) -> str:
-        """按 patch 顺序生成提交信息，例如 `diary: 新增日志4# 2026-04-16 19:03:34`。"""
+        """按 patch 顺序生成提交信息，例如 `diary: 新增日记（id: 4）# 2026-04-16 19:03:34`。"""
         parts: list[str] = []
         for p in self.store.patches:
             op = p.get("op")
@@ -997,7 +1215,8 @@ class MizukiDiaryPlugin(Star):
                 item = p.get("item") or {}
                 pid = item.get("id", "?")
                 date = item.get("date", "")
-                parts.append(f"新增日志{pid}# {date}".rstrip())
+                tail = f"# {date}" if date else ""
+                parts.append(f"新增日记（id: {pid}）{tail}".rstrip())
             elif op == "edit":
                 pid = p.get("id", "?")
                 fields = p.get("fields") or {}
@@ -1008,11 +1227,12 @@ class MizukiDiaryPlugin(Star):
                         date = (it.get("date") if it else "") or ""
                     except (TypeError, ValueError):
                         pass
-                parts.append(f"修改日志{pid}# {date}".rstrip())
+                tail = f"# {date}" if date else ""
+                parts.append(f"修改日记（id: {pid}）{tail}".rstrip())
             elif op == "delete":
-                parts.append(f"删除日志{p.get('id', '?')}")
+                parts.append(f"删除日记（id: {p.get('id', '?')}）")
             elif op == "restore":
-                parts.append(f"恢复日志{p.get('id', '?')}")
+                parts.append(f"恢复日记（id: {p.get('id', '?')}）")
         if not parts:
             return "diary: update"
         return "diary: " + "、".join(parts)

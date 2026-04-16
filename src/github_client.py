@@ -5,11 +5,12 @@
 - 获取分支 HEAD 的 commit / tree sha
 - 创建 blob / tree / commit / 更新 ref
 
-所有方法都是 async，基于 aiohttp。
+所有方法都是 async，基于 aiohttp。瞬时网络错误（断开、超时、5xx）带指数退避重试。
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from typing import Any
 
@@ -18,6 +19,18 @@ import aiohttp
 
 class GithubError(Exception):
     pass
+
+
+_RETRYABLE_EXC = (
+    aiohttp.ServerDisconnectedError,
+    aiohttp.ClientConnectorError,
+    aiohttp.ClientOSError,
+    aiohttp.ClientPayloadError,
+    asyncio.TimeoutError,
+)
+_RETRYABLE_STATUS = {500, 502, 503, 504}
+_MAX_ATTEMPTS = 4
+_BACKOFF_BASE = 1.5
 
 
 class GithubClient:
@@ -39,6 +52,13 @@ class GithubClient:
             "User-Agent": "astrbot-plugin-mizuki-diary",
         }
 
+    def _new_session(self) -> aiohttp.ClientSession:
+        timeout = aiohttp.ClientTimeout(total=60, connect=15)
+        connector = aiohttp.TCPConnector(
+            limit=4, force_close=True, enable_cleanup_closed=True
+        )
+        return aiohttp.ClientSession(timeout=timeout, connector=connector)
+
     async def _request(
         self,
         session: aiohttp.ClientSession,
@@ -47,36 +67,46 @@ class GithubClient:
         *,
         json_body: Any = None,
     ) -> dict[str, Any]:
-        async with session.request(
-            method, url, headers=self._headers(), json=json_body
-        ) as r:
-            text = await r.text()
-            if r.status >= 400:
-                raise GithubError(
-                    f"GitHub API {method} {url} -> {r.status}: {text[:500]}"
-                )
-            if not text:
-                return {}
-            return await _loads(text)
+        last_exc: Exception | None = None
+        for attempt in range(1, _MAX_ATTEMPTS + 1):
+            try:
+                async with session.request(
+                    method, url, headers=self._headers(), json=json_body
+                ) as r:
+                    text = await r.text()
+                    if r.status in _RETRYABLE_STATUS and attempt < _MAX_ATTEMPTS:
+                        await asyncio.sleep(_BACKOFF_BASE ** attempt)
+                        continue
+                    if r.status >= 400:
+                        raise GithubError(
+                            f"GitHub API {method} {url} -> {r.status}: {text[:500]}"
+                        )
+                    if not text:
+                        return {}
+                    return await _loads(text)
+            except _RETRYABLE_EXC as e:
+                last_exc = e
+                if attempt >= _MAX_ATTEMPTS:
+                    break
+                await asyncio.sleep(_BACKOFF_BASE ** attempt)
+        raise GithubError(
+            f"GitHub API {method} {url} 连接失败（已重试 {_MAX_ATTEMPTS} 次）: {last_exc}"
+        )
 
     async def get_file(self, path: str) -> tuple[str, str]:
         """读取文件内容。返回 (content_utf8, blob_sha)。"""
         url = f"{self.api_base}/contents/{path}?ref={self.branch}"
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=self._headers()) as r:
-                if r.status == 404:
-                    raise GithubError(f"文件不存在: {path}")
-                if r.status >= 400:
-                    body = await r.text()
-                    raise GithubError(f"获取文件失败 {r.status}: {body[:500]}")
-                data = await r.json()
+        async with self._new_session() as s:
+            data = await self._request(s, "GET", url)
+        if not data:
+            raise GithubError(f"读取 {path} 返回空响应")
         content_b64 = data["content"]
         content = base64.b64decode(content_b64).decode("utf-8")
         return content, data["sha"]
 
     async def get_branch_head(self) -> tuple[str, str]:
         """返回 (commit_sha, tree_sha)。"""
-        async with aiohttp.ClientSession() as s:
+        async with self._new_session() as s:
             ref = await self._request(
                 s, "GET", f"{self.api_base}/git/ref/heads/{self.branch}"
             )
@@ -97,7 +127,7 @@ class GithubClient:
         """
         if not files:
             raise GithubError("commit_files 调用时 files 为空")
-        async with aiohttp.ClientSession() as s:
+        async with self._new_session() as s:
             ref = await self._request(
                 s, "GET", f"{self.api_base}/git/ref/heads/{self.branch}"
             )

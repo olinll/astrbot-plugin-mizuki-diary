@@ -69,15 +69,28 @@ class DiaryStore:
         return out
 
 
+def _norm_id(x: Any) -> Any:
+    """尽量把 id 归一为 int；不能转换则原样返回。"""
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return x
+
+
 def apply_patches(
     remote_items: list[dict[str, Any]],
     patches: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """把 patches 按顺序叠加到 remote_items 上，返回当前工作视图。"""
+    """把 patches 按顺序叠加到 remote_items 上，返回当前工作视图。
+
+    id 查找时两端归一为 int，避免 AstrBot 传 `"4"`（str）而远程解析出 `4`（int）
+    导致 delete/edit/restore 静默跳过。
+    """
     items = [dict(it) for it in remote_items]
-    idx_by_id: dict[int, int] = {
-        it["id"]: i for i, it in enumerate(items) if "id" in it
-    }
+    idx_by_id: dict[Any, int] = {}
+    for i, it in enumerate(items):
+        if "id" in it:
+            idx_by_id[_norm_id(it["id"])] = i
     for p in patches:
         op = p.get("op")
         if op == "add":
@@ -85,19 +98,19 @@ def apply_patches(
             new_item.setdefault("_deleted", False)
             items.append(new_item)
             if "id" in new_item:
-                idx_by_id[new_item["id"]] = len(items) - 1
+                idx_by_id[_norm_id(new_item["id"])] = len(items) - 1
         elif op == "edit":
-            i = idx_by_id.get(p["id"])
+            i = idx_by_id.get(_norm_id(p.get("id")))
             if i is None:
                 continue
             items[i].update(p["fields"])
         elif op == "delete":
-            i = idx_by_id.get(p["id"])
+            i = idx_by_id.get(_norm_id(p.get("id")))
             if i is None:
                 continue
             items[i]["_deleted"] = True
         elif op == "restore":
-            i = idx_by_id.get(p["id"])
+            i = idx_by_id.get(_norm_id(p.get("id")))
             if i is None:
                 continue
             items[i]["_deleted"] = False
