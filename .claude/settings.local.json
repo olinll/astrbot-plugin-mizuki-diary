@@ -13,7 +13,10 @@
       "Bash(curl -s -L \"https://raw.githubusercontent.com/AstrBotDevs/AstrBot/master/astrbot/core/message/components.py\" -o \"D:/projects/astrbot-plugin-mizuki-diary/.research/components.py\")",
       "Bash(curl -s \"https://api.github.com/repos/olinll/Mizuki-Content/contents/\")",
       "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(x['type'], x['name']\\) for x in d]\")",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "Read(//c/Users/olinl/AppData/Roaming/astrbot/data/plugin_data/**)",
+      "Read(//c/Users/olinl/.astrbot/data/plugin_data/**)",
+      "Bash(pip show:*)"
     ]
   }
 }

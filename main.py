@@ -149,10 +149,18 @@ class MizukiDiaryPlugin(Star):
                 s.add(t)
         return sorted(s)
 
-    def _find_item(self, working: list[dict[str, Any]], id_: int) -> dict[str, Any] | None:
+    def _find_item(self, working: list[dict[str, Any]], id_: Any) -> dict[str, Any] | None:
+        try:
+            target = int(id_)
+        except (TypeError, ValueError):
+            return None
         for it in working:
-            if int(it.get("id", -1)) == id_:
-                return it
+            raw = it.get("id")
+            try:
+                if int(raw) == target:
+                    return it
+            except (TypeError, ValueError):
+                continue
         return None
 
     @staticmethod
@@ -168,6 +176,27 @@ class MizukiDiaryPlugin(Star):
             return text
         except ValueError:
             return None
+
+    async def _fetch_to_preview_cache(self, url: str) -> Path | None:
+        """下载远端图片到 image_cache_dir，按 URL 最后一段命名以便去重。"""
+        import aiohttp
+
+        name = url.rsplit("/", 1)[-1] or f"{uuid.uuid4().hex}.bin"
+        local = self.image_cache_dir / f"preview_{name}"
+        if local.exists() and local.stat().st_size > 0:
+            return local
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    if r.status != 200:
+                        logger.warning(f"[mizuki_diary] fetch {url} -> {r.status}")
+                        return None
+                    data = await r.read()
+        except Exception as e:
+            logger.warning(f"[mizuki_diary] fetch {url} error: {e}")
+            return None
+        local.write_bytes(data)
+        return local
 
     async def _download_and_process_image(
         self, img_comp: Comp.Image, diary_date: str, diary_id: int, index: int
@@ -252,12 +281,16 @@ class MizukiDiaryPlugin(Star):
         if not item:
             yield event.plain_result(f"未找到 id={id} 的日记。")
             return
-        chain: list[Any] = [Comp.Plain(self._render_item_text(item))]
+        yield event.plain_result(self._render_item_text(item))
         for url in item.get("images") or []:
             abs_url = self._resolve_image_url(url)
-            if abs_url:
-                chain.append(Comp.Image.fromURL(abs_url))
-        yield event.chain_result(chain)
+            if not abs_url:
+                continue
+            local_path = await self._fetch_to_preview_cache(abs_url)
+            if local_path is None:
+                yield event.plain_result(f"[图片加载失败] {abs_url}")
+                continue
+            yield event.chain_result([Comp.Image.fromFileSystem(str(local_path))])
 
     def _render_item_text(self, item: dict[str, Any]) -> str:
         lines = []
@@ -416,7 +449,6 @@ class MizukiDiaryPlugin(Star):
         @session_waiter(timeout=timeout, record_history_chains=False)
         async def waiter(controller: SessionController, evt: AstrMessageEvent):
             text = evt.message_str.strip() if evt.message_str else ""
-            logger.info(f"[mizuki_diary] add waiter got: {text!r} step={state['step']}")
 
             if _is_token(text, CANCEL_TOKENS):
                 state["cancelled"] = True
@@ -482,7 +514,6 @@ class MizukiDiaryPlugin(Star):
     async def _step_content(self, controller, evt, state, timeout):
         text_raw = evt.message_str or ""
         text = text_raw.strip()
-        logger.info(f"[mizuki_diary] content step received: {text!r}")
 
         if _is_token(text, DONE_TOKENS):
             if not state["content_lines"]:
@@ -545,25 +576,37 @@ class MizukiDiaryPlugin(Star):
                 )
                 state["images"].append(info)
             await evt.send(evt.plain_result(
-                f"已收到 {len(state['images'])} 张图，继续发送或 {DONE_DISPLAY} / skip。"
+                f"已收到 {len(state['images'])} 张图，继续发送或 {DONE_DISPLAY} 进入下一步。\n"
+                f"若要丢弃已收到的图片请发 clear。"
             ))
             controller.keep(timeout=timeout, reset_timeout=True)
             return
 
-        if _is_token(text, DONE_TOKENS):
+        if _is_token(text, DONE_TOKENS) or (
+            _is_token(text, SKIP_TOKENS) and state["images"]
+        ):
             if state["images"]:
                 state["item"]["images"] = [i["url"] for i in state["images"]]
             state["step"] = "location"
-            await evt.send(evt.plain_result("现在请发地点，skip 跳过。"))
+            await evt.send(evt.plain_result(
+                f"已记录 {len(state['images'])} 张图。现在请发地点，skip 跳过。"
+            ))
             controller.keep(timeout=timeout, reset_timeout=True)
             return
 
         if _is_token(text, SKIP_TOKENS):
+            state["step"] = "location"
+            await evt.send(evt.plain_result("已跳过图片。现在请发地点，skip 跳过。"))
+            controller.keep(timeout=timeout, reset_timeout=True)
+            return
+
+        if _is_token(text, CLEAR_TOKENS):
             for i in state["images"]:
                 Path(i["local_path"]).unlink(missing_ok=True)
             state["images"] = []
-            state["step"] = "location"
-            await evt.send(evt.plain_result("已跳过图片。现在请发地点，skip 跳过。"))
+            await evt.send(evt.plain_result(
+                f"已清空。继续发图片，或 {DONE_DISPLAY} / skip 进入下一步。"
+            ))
             controller.keep(timeout=timeout, reset_timeout=True)
             return
 
@@ -907,7 +950,7 @@ class MizukiDiaryPlugin(Star):
             return
 
         try:
-            commit_sha = await self._do_push(counts)
+            commit_sha = await self._do_push()
         except (GithubError, diary_parser.DiaryParseError) as e:
             yield event.plain_result(f"推送失败：{e}")
             return
@@ -918,7 +961,36 @@ class MizukiDiaryPlugin(Star):
 
         yield event.plain_result(f"推送成功 ✅\ncommit: {commit_sha[:10]}")
 
-    async def _do_push(self, counts: dict[str, int]) -> str:
+    def _build_commit_message(self, working: list[dict[str, Any]]) -> str:
+        """按 patch 顺序生成提交信息，例如 `diary: 新增日志4# 2026-04-16 19:03:34`。"""
+        parts: list[str] = []
+        for p in self.store.patches:
+            op = p.get("op")
+            if op == "add":
+                item = p.get("item") or {}
+                pid = item.get("id", "?")
+                date = item.get("date", "")
+                parts.append(f"新增日志{pid}# {date}".rstrip())
+            elif op == "edit":
+                pid = p.get("id", "?")
+                fields = p.get("fields") or {}
+                date = fields.get("date") or ""
+                if not date:
+                    try:
+                        it = self._find_item(working, int(pid))
+                        date = (it.get("date") if it else "") or ""
+                    except (TypeError, ValueError):
+                        pass
+                parts.append(f"修改日志{pid}# {date}".rstrip())
+            elif op == "delete":
+                parts.append(f"删除日志{p.get('id', '?')}")
+            elif op == "restore":
+                parts.append(f"恢复日志{p.get('id', '?')}")
+        if not parts:
+            return "diary: update"
+        return "diary: " + "、".join(parts)
+
+    async def _do_push(self) -> str:
         client = self._client()
         diary_path = self.config.get("diary_file_path", "data/diary.ts")
         content, _ = await client.get_file(diary_path)
@@ -933,11 +1005,7 @@ class MizukiDiaryPlugin(Star):
             data = Path(img["local_path"]).read_bytes()
             files.append({"path": img["remote_path"], "content": data})
 
-        summary = (
-            f"+{counts['add']} 新增 ~{counts['edit']} 修改 "
-            f"-{counts['delete']} 删除 ↺{counts['restore']} 恢复"
-        )
-        message = f"diary: {summary}"
+        message = self._build_commit_message(working)
         commit_sha = await client.commit_files(files, message)
 
         # cleanup
