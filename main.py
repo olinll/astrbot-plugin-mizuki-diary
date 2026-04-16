@@ -24,6 +24,8 @@ from .src import diary_parser, image_utils
 from .src.diary_store import DiaryStore, apply_patches
 from .src.github_client import GithubClient, GithubError
 from .src.image_utils import ImageError
+from .src.memos_client import MemosClient, MemosError
+from .src.memos_mapping import MemosMapping
 
 PLUGIN_NAME = "astrbot_plugin_mizuki_diary"
 
@@ -48,6 +50,7 @@ HELP_TEXT = (
     "/diary diff                查看本地 pending 改动\n"
     "/diary discard             放弃所有 pending\n"
     "/diary push                推送到 GitHub（二次确认）\n"
+    "/diary sync memos          把未映射的日记批量同步到 memos\n"
     "/diary cancel              取消当前多轮对话\n"
     "\nquick 的首行可加 # 字段头：#地点:xxx #心情:xxx #标签:a,b #日期:YYYY-MM-DD HH:mm:ss"
     "\n多轮对话内：/diary done 结束当前步骤；skip/跳过 跳过可选项；/diary cancel 取消。"
@@ -85,6 +88,88 @@ def _looks_like_slash_cmd(text: str) -> bool:
     return t.startswith("/") or t.startswith("diary ")
 
 
+def _parse_meta_line(s: str) -> tuple[str, str, bool]:
+    """从 '📍 xxx 💭 yyy' 这种单行里拆出 location/mood。
+
+    返回 (location, mood, matched)；matched=True 表示至少识别到一个表情头。
+    兼容只有一项、或表情在任意位置的情况，但要求整行只含这 0-2 段内容。
+    """
+    import re
+
+    if "\n" in s:
+        return "", "", False
+    pin_re = re.compile(r"📍\s*([^💭]+?)(?=\s*💭|$)")
+    mood_re = re.compile(r"💭\s*([^📍]+?)(?=\s*📍|$)")
+    loc = ""
+    mood = ""
+    matched = False
+    m = pin_re.search(s)
+    if m:
+        loc = m.group(1).strip()
+        matched = True
+    m = mood_re.search(s)
+    if m:
+        mood = m.group(1).strip()
+        matched = True
+    # 确保整行除了这两个片段外没有其他内容
+    if matched:
+        remainder = s
+        remainder = pin_re.sub("", remainder)
+        remainder = mood_re.sub("", remainder)
+        if remainder.replace("📍", "").replace("💭", "").strip():
+            return "", "", False
+    return loc, mood, matched
+
+
+def _parse_tag_line(s: str) -> list[str] | None:
+    """如果一行全是 '#tag1 #tag2' 形式则返回 tag 列表，否则 None。"""
+    if not s:
+        return None
+    tokens = s.split()
+    if not tokens:
+        return None
+    out: list[str] = []
+    for tok in tokens:
+        if not tok.startswith("#") or len(tok) < 2:
+            return None
+        out.append(tok[1:])
+    return out
+
+
+def _parse_iso8601(s: str):
+    from datetime import datetime
+
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s)
+    except ValueError:
+        return None
+
+
+def _parse_diary_date(s, tz):
+    from datetime import datetime
+
+    if not s:
+        return None
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        return dt.replace(tzinfo=tz)
+    except (ValueError, TypeError):
+        return None
+
+
+def _memo_display_date(memo: dict, tz) -> str | None:
+    """取 memo 的 displayTime / createTime，格式化为 diary date 字符串。"""
+    iso = memo.get("displayTime") or memo.get("createTime") or ""
+    dt = _parse_iso8601(iso)
+    if dt is None:
+        return None
+    return dt.astimezone(tz).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _event_has_payload(evt) -> bool:
     """判断事件是否包含可处理内容（文本或图片）。
 
@@ -119,6 +204,7 @@ class MizukiDiaryPlugin(Star):
         self.image_cache_dir = data_root / "image_cache"
         self.image_cache_dir.mkdir(exist_ok=True)
         self.store = DiaryStore(data_root / "pending.json")
+        self.memos_map = MemosMapping(data_root / "memos_mapping.json")
 
     async def terminate(self):
         pass
@@ -131,6 +217,37 @@ class MizukiDiaryPlugin(Star):
             self.config.get("github_repo", ""),
             self.config.get("github_branch", "master"),
         )
+
+    def _memos_client(self) -> MemosClient | None:
+        if not self.config.get("memos_enabled", False):
+            return None
+        return MemosClient(
+            self.config.get("memos_host", ""),
+            self.config.get("memos_access_token", ""),
+            self.config.get("memos_visibility", "PUBLIC"),
+        )
+
+    @staticmethod
+    def _format_memo_content(item: dict[str, Any]) -> str:
+        """拼出 memos 正文：首行 #日记 标记、📍/💭 元数据、空行、正文、空行、#tag。
+
+        首行 #日记 是反向同步（memos → mizuki）的过滤标记。
+        """
+        segments: list[str] = ["#日记"]
+        meta_parts: list[str] = []
+        if item.get("location"):
+            meta_parts.append(f"📍 {item['location']}")
+        if item.get("mood"):
+            meta_parts.append(f"💭 {item['mood']}")
+        if meta_parts:
+            segments.append(" ".join(meta_parts))
+        body = (item.get("content") or "").strip()
+        if body:
+            segments.append(body)
+        tags = item.get("tags") or []
+        if tags:
+            segments.append(" ".join(f"#{t}" for t in tags))
+        return "\n\n".join(segments)
 
     def _tz(self) -> ZoneInfo:
         try:
@@ -1195,16 +1312,346 @@ class MizukiDiaryPlugin(Star):
             return
 
         try:
-            commit_sha = await self._do_push()
-        except (GithubError, diary_parser.DiaryParseError) as e:
-            yield event.plain_result(f"推送失败：{e}")
-            return
+            result = await self._do_push()
         except Exception as e:
             logger.exception("diary push failed")
             yield event.plain_result(f"推送异常：{e}")
             return
 
-        yield event.plain_result(f"推送成功 ✅\ncommit: {commit_sha[:10]}")
+        yield event.plain_result(self._format_push_result(result))
+
+    # ------------------------------------------------------------------- sync
+
+    @diary.command("sync")
+    async def cmd_sync(self, event: AstrMessageEvent, target: str = ""):
+        if not self._is_allowed(event):
+            yield self._deny(event)
+            return
+        t = (target or "").strip().lower()
+        if t == "memos":
+            async for msg in self._sync_to_memos(event):
+                yield msg
+        elif t == "mizuki":
+            async for msg in self._sync_from_memos(event):
+                yield msg
+        else:
+            yield event.plain_result(
+                "用法：\n"
+                "/diary sync memos   GitHub → memos（补齐未映射的条目）\n"
+                "/diary sync mizuki  memos → GitHub（生成 pending，再 /diary push）"
+            )
+
+    async def _sync_to_memos(self, event: AstrMessageEvent):
+        memos = self._memos_client()
+        if memos is None:
+            yield event.plain_result("memos 未启用，请先在插件配置开启 memos_enabled。")
+            return
+        try:
+            _, working = await self._current_view()
+        except (GithubError, diary_parser.DiaryParseError) as e:
+            yield event.plain_result(f"获取远程失败：{e}")
+            return
+
+        ok = failed = skipped_mapped = skipped_no_id = 0
+        img_missing = 0
+        errors: list[str] = []
+
+        for item in working:
+            diary_id = item.get("id")
+            if diary_id is None:
+                skipped_no_id += 1
+                continue
+            if self.memos_map.get(diary_id):
+                skipped_mapped += 1
+                continue
+            try:
+                attachments, miss = await self._upload_item_images_to_memos(
+                    memos, item
+                )
+                img_missing += miss
+                content = self._format_memo_content(item)
+                visibility = "PRIVATE" if item.get("_deleted") else None
+                memo_name = await memos.create_memo(
+                    content, attachments=attachments, visibility=visibility
+                )
+                self.memos_map.set(diary_id, memo_name)
+                ok += 1
+            except MemosError as e:
+                failed += 1
+                errors.append(f"#{diary_id}: {e}")
+            except Exception as e:
+                logger.exception("sync to memos failed for item")
+                failed += 1
+                errors.append(f"#{diary_id}: {e}")
+
+        lines = [
+            f"GitHub → memos 完成：",
+            f"  新建 {ok}、跳过已映射 {skipped_mapped}、失败 {failed}",
+        ]
+        if img_missing:
+            lines.append(f"  其中 {img_missing} 张图片下载失败（memo 已建、无附件）")
+        for err in errors[:3]:
+            lines.append(f"  · {err}")
+        yield event.plain_result("\n".join(lines))
+
+    async def _upload_item_images_to_memos(
+        self, memos: MemosClient, item: dict[str, Any]
+    ) -> tuple[list[str], int]:
+        """把 item.images（GitHub 路径）下载 → 上传到 memos，返回 (attachments, 失败数)。"""
+        import aiohttp
+
+        attachments: list[str] = []
+        failed = 0
+        for url in item.get("images") or []:
+            abs_url = self._resolve_image_url(url)
+            if not abs_url:
+                failed += 1
+                continue
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        abs_url, timeout=aiohttp.ClientTimeout(total=30)
+                    ) as r:
+                        if r.status != 200:
+                            failed += 1
+                            continue
+                        data = await r.read()
+                filename = abs_url.rsplit("/", 1)[-1] or "image.webp"
+                name = await memos.create_attachment(
+                    filename, data, mime="image/webp"
+                )
+                attachments.append(name)
+            except Exception as e:
+                logger.warning(f"[mizuki_diary] upload {abs_url} -> memos failed: {e}")
+                failed += 1
+        return attachments, failed
+
+    async def _sync_from_memos(self, event: AstrMessageEvent):
+        memos = self._memos_client()
+        if memos is None:
+            yield event.plain_result("memos 未启用，请先在插件配置开启 memos_enabled。")
+            return
+        try:
+            _, working = await self._current_view()
+        except (GithubError, diary_parser.DiaryParseError) as e:
+            yield event.plain_result(f"获取远程失败：{e}")
+            return
+
+        try:
+            all_memos = await memos.list_memos()
+        except MemosError as e:
+            yield event.plain_result(f"获取 memos 列表失败：{e}")
+            return
+
+        reverse_map = self.memos_map.reverse()
+        added = edited = skipped = 0
+        img_failed = 0
+        errors: list[str] = []
+        next_id = self._next_id(working)
+
+        for memo in all_memos:
+            content = memo.get("content") or ""
+            first_line = content.splitlines()[0].strip() if content else ""
+            if not first_line.startswith("#日记"):
+                skipped += 1
+                continue
+            if (memo.get("state") or "NORMAL").upper() == "ARCHIVED":
+                skipped += 1
+                continue
+
+            memo_name = memo.get("name") or ""
+            diary_id_str = reverse_map.get(memo_name)
+            try:
+                fields = self._parse_memo_content(content)
+                img_files, miss = await self._fetch_memo_attachments(
+                    memos, memo, fields.get("date") or self._now_str(),
+                    int(diary_id_str) if diary_id_str else next_id,
+                )
+                img_failed += miss
+
+                if diary_id_str is not None:
+                    # 已映射 → 看 updateTime
+                    diary_id = int(diary_id_str)
+                    item = self._find_item(working, diary_id)
+                    memo_update = _parse_iso8601(memo.get("updateTime") or "")
+                    item_date = _parse_diary_date(
+                        item.get("date") if item else None, self._tz()
+                    )
+                    if item and memo_update and item_date and memo_update <= item_date:
+                        skipped += 1
+                        continue
+                    patch_fields = dict(fields)
+                    if img_files:
+                        patch_fields["images"] = [
+                            f"{self.config.get('image_url_prefix', '/images/diary').rstrip('/')}/"
+                            f"{Path(x['remote_path']).name}"
+                            for x in img_files
+                        ]
+                    patch: dict[str, Any] = {
+                        "op": "edit",
+                        "id": diary_id,
+                        "fields": patch_fields,
+                        "_from_memos_sync": True,
+                    }
+                    if img_files:
+                        patch["image_files"] = img_files
+                    self.store.add_patch(patch)
+                    edited += 1
+                else:
+                    # 未映射 → 新建
+                    new_id = next_id
+                    next_id += 1
+                    date_str = fields.get("date") or _memo_display_date(
+                        memo, self._tz()
+                    ) or self._now_str()
+                    new_item: dict[str, Any] = {
+                        "id": new_id,
+                        "content": fields.get("content", ""),
+                        "date": date_str,
+                    }
+                    if fields.get("location"):
+                        new_item["location"] = fields["location"]
+                    if fields.get("mood"):
+                        new_item["mood"] = fields["mood"]
+                    if fields.get("tags"):
+                        new_item["tags"] = fields["tags"]
+                    if img_files:
+                        url_prefix = self.config.get(
+                            "image_url_prefix", "/images/diary"
+                        ).rstrip("/")
+                        new_item["images"] = [
+                            f"{url_prefix}/{Path(x['remote_path']).name}"
+                            for x in img_files
+                        ]
+                    patch = {
+                        "op": "add",
+                        "item": new_item,
+                        "image_files": img_files,
+                        "_from_memos_sync": True,
+                        "_memo_name": memo_name,
+                    }
+                    self.store.add_patch(patch)
+                    self.memos_map.set(new_id, memo_name)
+                    added += 1
+            except Exception as e:
+                logger.exception("sync from memos failed for memo %s", memo.get("name"))
+                errors.append(f"{memo.get('name')}: {e}")
+
+        lines = [
+            f"memos → pending 完成：",
+            f"  新增 {added}、修改 {edited}、跳过 {skipped}、失败 {len(errors)}",
+        ]
+        if img_failed:
+            lines.append(f"  {img_failed} 张附件下载/转换失败")
+        for err in errors[:3]:
+            lines.append(f"  · {err}")
+        lines.append("使用 /diary diff 预览，/diary push 推送到 GitHub。")
+        yield event.plain_result("\n".join(lines))
+
+    _MEMO_META_RE = None  # filled below as module-level
+
+    def _parse_memo_content(self, content: str) -> dict[str, Any]:
+        """反解 memos 正文：去掉首行 #日记 ，识别 📍/💭 首段和末段 #tags，其余为正文。
+
+        无法完全匹配格式时，除首行 #日记 外的全文作为 content。
+        """
+        lines = content.splitlines()
+        if lines and lines[0].strip().startswith("#日记"):
+            lines = lines[1:]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        body = "\n".join(lines)
+        if not body:
+            return {"content": ""}
+
+        paragraphs = [p for p in body.split("\n\n")]
+        fields: dict[str, Any] = {}
+
+        if paragraphs:
+            head = paragraphs[0].strip()
+            loc, mood, matched = _parse_meta_line(head)
+            if matched:
+                if loc:
+                    fields["location"] = loc
+                if mood:
+                    fields["mood"] = mood
+                paragraphs = paragraphs[1:]
+
+        if paragraphs:
+            tail = paragraphs[-1].strip()
+            tags = _parse_tag_line(tail)
+            if tags is not None:
+                clean_tags = [t for t in tags if t != "日记"]
+                if clean_tags:
+                    fields["tags"] = clean_tags
+                paragraphs = paragraphs[:-1]
+
+        fields["content"] = "\n\n".join(p.strip() for p in paragraphs).strip()
+        return fields
+
+    async def _fetch_memo_attachments(
+        self,
+        memos: MemosClient,
+        memo: dict[str, Any],
+        diary_date: str,
+        diary_id: int,
+    ) -> tuple[list[dict[str, str]], int]:
+        """下载 memo 的附件 → 转 webp → 写入本地缓存，返回 image_files + 失败数。"""
+        out: list[dict[str, str]] = []
+        failed = 0
+        image_repo_dir = self.config.get("image_repo_dir", "images/diary").strip("/")
+        quality = int(self.config.get("webp_quality", 85))
+        date_part = (diary_date or "").split(" ")[0] or "unknown"
+        for att in memo.get("attachments") or []:
+            att_name = att.get("name") or ""
+            att_filename = att.get("filename") or "attachment"
+            att_type = (att.get("type") or "").lower()
+            if not att_name or not att_type.startswith("image/"):
+                continue
+            try:
+                data = await memos.download_attachment(att_name, att_filename)
+                webp = image_utils.to_webp(data, quality)
+            except Exception as e:
+                logger.warning(f"[mizuki_diary] fetch/convert {att_name} failed: {e}")
+                failed += 1
+                continue
+            index = len(out) + 1
+            filename = f"{date_part}-{diary_id}-{index}.webp"
+            local = self.image_cache_dir / f"{uuid.uuid4().hex}.webp"
+            local.write_bytes(webp)
+            out.append(
+                {
+                    "local_path": str(local),
+                    "remote_path": f"{image_repo_dir}/{filename}",
+                }
+            )
+        return out, failed
+
+    @staticmethod
+    def _format_push_result(result: dict[str, Any]) -> str:
+        lines: list[str] = []
+        if result.get("github_ok"):
+            sha = (result.get("commit_sha") or "")[:10]
+            lines.append(f"GitHub 推送成功 ✅ commit: {sha}")
+        elif result.get("github_error"):
+            lines.append(f"GitHub 推送失败 ❌ {result['github_error']}")
+        if result.get("memos_enabled"):
+            ok = result.get("memos_ok", 0)
+            fail = result.get("memos_failed", 0)
+            skipped = result.get("memos_skipped", 0)
+            parts = [f"memos 同步 {ok} 成功"]
+            if fail:
+                parts.append(f"{fail} 失败")
+            if skipped:
+                parts.append(f"{skipped} 跳过")
+            emoji = "✅" if fail == 0 else "⚠️"
+            lines.append(f"{emoji} " + "、".join(parts))
+            if result.get("memos_errors"):
+                for err in result["memos_errors"][:3]:
+                    lines.append(f"  · {err}")
+        return "\n".join(lines) if lines else "无操作"
 
     def _build_commit_message(self, working: list[dict[str, Any]]) -> str:
         """按 patch 顺序生成提交信息，例如 `diary: 新增日记（id: 4）# 2026-04-16 19:03:34`。"""
@@ -1237,29 +1684,174 @@ class MizukiDiaryPlugin(Star):
             return "diary: update"
         return "diary: " + "、".join(parts)
 
-    async def _do_push(self) -> str:
-        client = self._client()
+    async def _do_push(self) -> dict[str, Any]:
+        """推送 pending → GitHub + memos（相互独立）。
+
+        GitHub 失败不阻止 memos 同步；memos 失败也不影响 GitHub 的 commit。
+        只有当 GitHub 和 memos 都失败（或 memos 禁用时 GitHub 失败）时保留 pending，
+        其他情况清空 pending 并清理本地图片缓存。
+        """
+        patches_snapshot = list(self.store.patches)
         diary_path = self.config.get("diary_file_path", "data/diary.ts")
-        content, _ = await client.get_file(diary_path)
-        remote = diary_parser.parse(content)
-        working = apply_patches(remote, self.store.patches)
-        new_content = diary_parser.regenerate(content, working)
 
-        files: list[dict[str, Any]] = [
-            {"path": diary_path, "content": new_content.encode("utf-8")}
-        ]
-        for img in self.store.collect_image_files():
-            data = Path(img["local_path"]).read_bytes()
-            files.append({"path": img["remote_path"], "content": data})
+        client = self._client()
+        result: dict[str, Any] = {
+            "github_ok": False,
+            "github_error": None,
+            "commit_sha": None,
+            "memos_enabled": bool(self.config.get("memos_enabled", False)),
+            "memos_ok": 0,
+            "memos_failed": 0,
+            "memos_skipped": 0,
+            "memos_errors": [],
+        }
 
-        message = self._build_commit_message(working)
-        commit_sha = await client.commit_files(files, message)
+        # --- GitHub 推送 ---
+        working: list[dict[str, Any]] = []
+        try:
+            content, _ = await client.get_file(diary_path)
+            remote = diary_parser.parse(content)
+            working = apply_patches(remote, patches_snapshot)
+            new_content = diary_parser.regenerate(content, working)
 
-        # cleanup
-        for img in self.store.collect_image_files():
+            files: list[dict[str, Any]] = [
+                {"path": diary_path, "content": new_content.encode("utf-8")}
+            ]
+            for img in self.store.collect_image_files():
+                data = Path(img["local_path"]).read_bytes()
+                files.append({"path": img["remote_path"], "content": data})
+
+            message = self._build_commit_message(working)
+            commit_sha = await client.commit_files(files, message)
+            result["github_ok"] = True
+            result["commit_sha"] = commit_sha
+        except (GithubError, diary_parser.DiaryParseError) as e:
+            result["github_error"] = str(e)
+        except Exception as e:
+            logger.exception("diary GitHub push failed")
+            result["github_error"] = str(e)
+
+        # --- memos 同步（独立于 GitHub）---
+        if result["memos_enabled"]:
+            # 若 GitHub 失败我们没有 working 视图，需要自建一个用于查 edit 后的完整条目
+            if not working:
+                try:
+                    content, _ = await client.get_file(diary_path)
+                    remote = diary_parser.parse(content)
+                    working = apply_patches(remote, patches_snapshot)
+                except Exception as e:
+                    working = []
+                    result["memos_errors"].append(f"取远程失败（仅用于 memos）：{e}")
+
+            await self._sync_patches_to_memos(patches_snapshot, working, result)
+
+        # --- 清理：GitHub 成功即可丢掉本地图片 & pending；失败则保留以便重试 ---
+        if result["github_ok"]:
+            for img in self.store.collect_image_files():
+                try:
+                    Path(img["local_path"]).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            self.store.clear()
+
+        return result
+
+    async def _sync_patches_to_memos(
+        self,
+        patches: list[dict[str, Any]],
+        working: list[dict[str, Any]],
+        result: dict[str, Any],
+    ) -> None:
+        """把 add/edit patches 同步到 memos；delete/restore 静默跳过。"""
+        try:
+            memos = self._memos_client()
+        except MemosError as e:
+            result["memos_errors"].append(f"memos 配置错误：{e}")
+            result["memos_failed"] += sum(
+                1 for p in patches if p.get("op") in ("add", "edit")
+            )
+            return
+        if memos is None:
+            return
+
+        for p in patches:
+            op = p.get("op")
+            if op not in ("add", "edit"):
+                result["memos_skipped"] += 1
+                continue
+            if p.get("_from_memos_sync"):
+                # 这条 patch 本身就是从 memos 同步过来的，避免回环。
+                result["memos_skipped"] += 1
+                continue
             try:
-                Path(img["local_path"]).unlink(missing_ok=True)
-            except Exception:
-                pass
-        self.store.clear()
-        return commit_sha
+                if op == "add":
+                    await self._memos_sync_add(memos, p)
+                else:
+                    await self._memos_sync_edit(memos, p, working)
+                result["memos_ok"] += 1
+            except MemosError as e:
+                result["memos_failed"] += 1
+                pid = (p.get("item", {}).get("id") if op == "add" else p.get("id"))
+                result["memos_errors"].append(f"#{pid} {op}: {e}")
+            except Exception as e:
+                logger.exception("memos sync failed for patch")
+                result["memos_failed"] += 1
+                pid = (p.get("item", {}).get("id") if op == "add" else p.get("id"))
+                result["memos_errors"].append(f"#{pid} {op}: {e}")
+
+    async def _memos_sync_add(self, memos: MemosClient, patch: dict[str, Any]) -> None:
+        item = patch.get("item") or {}
+        diary_id = item.get("id")
+        attachments: list[str] = []
+        for f in patch.get("image_files", []) or []:
+            local_path = Path(f["local_path"])
+            if not local_path.exists():
+                continue
+            data = local_path.read_bytes()
+            name = await memos.create_attachment(
+                local_path.name, data, mime="image/webp"
+            )
+            attachments.append(name)
+        content = self._format_memo_content(item)
+        memo_name = await memos.create_memo(content, attachments=attachments)
+        if diary_id is not None:
+            self.memos_map.set(diary_id, memo_name)
+
+    async def _memos_sync_edit(
+        self,
+        memos: MemosClient,
+        patch: dict[str, Any],
+        working: list[dict[str, Any]],
+    ) -> None:
+        diary_id = patch.get("id")
+        memo_name = self.memos_map.get(diary_id) if diary_id is not None else None
+        full_item = self._find_item(working, diary_id) if diary_id is not None else None
+
+        if memo_name is None:
+            # 没映射过 → 按新增处理（场景：在启用 memos 之前就 add 过）
+            if full_item is None:
+                raise MemosError(f"id={diary_id} 在远程找不到，无法补建 memo")
+            fake_patch = {"item": full_item, "image_files": patch.get("image_files") or []}
+            await self._memos_sync_add(memos, fake_patch)
+            return
+
+        if full_item is None:
+            raise MemosError(f"id={diary_id} 在远程找不到（edit 同步需要完整条目）")
+
+        content = self._format_memo_content(full_item)
+        await memos.update_memo_content(memo_name, content)
+
+        image_files = patch.get("image_files") or []
+        if image_files:
+            attachments: list[str] = []
+            for f in image_files:
+                local_path = Path(f["local_path"])
+                if not local_path.exists():
+                    continue
+                data = local_path.read_bytes()
+                name = await memos.create_attachment(
+                    local_path.name, data, mime="image/webp"
+                )
+                attachments.append(name)
+            if attachments:
+                await memos.set_memo_attachments(memo_name, attachments)

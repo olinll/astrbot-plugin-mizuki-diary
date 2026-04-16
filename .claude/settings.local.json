@@ -16,7 +16,14 @@
       "Bash(pip install:*)",
       "Read(//c/Users/olinl/AppData/Roaming/astrbot/data/plugin_data/**)",
       "Read(//c/Users/olinl/.astrbot/data/plugin_data/**)",
-      "Bash(pip show:*)"
+      "Bash(pip show:*)",
+      "Bash(curl -sL -A \"Mozilla/5.0\" \"https://usememos.com/docs/api/latest\" -o /tmp/memos_api.html)",
+      "Bash(py --version)",
+      "Bash(python -c ' *)",
+      "Bash(ls /tmp/memos_*.html)",
+      "Bash(cygpath -w /tmp/memos_api.html)",
+      "Bash(curl -sL -A \"Mozilla/5.0\" \"https://usememos.com/docs/api/latest/memoservice/SetMemoAttachments\" -o /tmp/memos_SetMemoAttachments.html)",
+      "Bash(python -m py_compile main.py src/memos_client.py src/memos_mapping.py)"
     ]
   }
 }

@@ -53,5 +53,25 @@
         "type": "int",
         "description": "图片转 WebP 的质量（1-100）",
         "default": 85
+    },
+    "memos_enabled": {
+        "type": "bool",
+        "description": "是否同步到 memos（独立于 GitHub；GitHub 失败不影响 memos）",
+        "default": false
+    },
+    "memos_host": {
+        "type": "string",
+        "description": "memos 服务地址，例如 https://memo.example.com（不要带尾部斜杠）",
+        "default": ""
+    },
+    "memos_access_token": {
+        "type": "string",
+        "description": "memos 访问令牌（Settings → My Account → Access Tokens）",
+        "default": ""
+    },
+    "memos_visibility": {
+        "type": "string",
+        "description": "memos 可见性：PUBLIC / PROTECTED / PRIVATE",
+        "default": "PUBLIC"
     }
 }
